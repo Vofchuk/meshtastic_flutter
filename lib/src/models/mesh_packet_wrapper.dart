@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import '../../generated/mesh.pb.dart';
 import '../../generated/portnums.pb.dart';
 
@@ -48,6 +50,16 @@ class MeshPacketWrapper {
 
   /// The port number indicating the app/service
   PortNum? get portnum => decoded?.portnum;
+
+  /// Numeric port number for filtering custom application traffic.
+  int? get portNum => decoded?.portnum.value;
+
+  /// Raw decoded payload bytes, if present.
+  Uint8List? get payload {
+    final bytes = decoded?.payload;
+    if (bytes == null) return null;
+    return Uint8List.fromList(bytes);
+  }
 
   /// Whether this is a text message
   bool get isTextMessage => portnum == PortNum.TEXT_MESSAGE_APP;

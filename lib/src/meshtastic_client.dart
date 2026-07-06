@@ -32,6 +32,9 @@ class MeshtasticClient {
   // Maximum packet size
   static const int _maxPacketSize = 512;
 
+  /// Broadcast destination node ID (all nodes).
+  static const int broadcastId = 0xFFFFFFFF;
+
   // Private fields
   BluetoothDevice? _device;
   BluetoothCharacteristic? _toRadioChar;
@@ -255,7 +258,7 @@ class MeshtasticClient {
   }
 
   /// Disconnect from the current device
-  Future<void> disconnect() async {
+  Future<void> disconnect({bool emitState = true}) async {
     _logger.info('Disconnecting from device');
 
     await _fromNumSubscription?.cancel();
@@ -282,7 +285,9 @@ class MeshtasticClient {
     _channels.clear();
     _localUser = null;
 
-    _emitConnectionState(MeshtasticConnectionState.disconnected);
+    if (emitState) {
+      _emitConnectionState(MeshtasticConnectionState.disconnected);
+    }
   }
 
   /// Send a text message to a specific node or broadcast
@@ -360,6 +365,59 @@ class MeshtasticClient {
 
     _logger.info(
       'Sending position: lat=$latitude, lon=$longitude, alt=$altitude',
+    );
+    await _sendPacket(packet);
+  }
+
+  /// Send an arbitrary binary payload on a custom port number.
+  ///
+  /// [portNum] must be a valid Meshtastic port (see `portnums.proto` in the
+  /// fork). Private application ports are in the 256–511 range; port 256 is
+  /// `PortNum.PRIVATE_APP`.
+  Future<void> sendData({
+    required int portNum,
+    required Uint8List payload,
+    int destinationId = broadcastId,
+    int channel = 0,
+    bool wantAck = false,
+  }) async {
+    if (!isConnected) {
+      throw const ConnectionException('Not connected to a device');
+    }
+
+    if (!isConfigured) {
+      throw const ConnectionException('Device configuration not complete');
+    }
+
+    final resolvedPort = PortNum.valueOf(portNum);
+    if (resolvedPort == null) {
+      throw ArgumentError.value(
+        portNum,
+        'portNum',
+        'Unknown port number; use a value defined in portnums.proto',
+      );
+    }
+
+    final packetId = DateTime.now().millisecondsSinceEpoch & 0xFFFFFFFF;
+
+    final packet = MeshPacket(
+      from: _myNodeInfo?.myNodeNum ?? 0,
+      to: destinationId,
+      channel: channel,
+      id: packetId,
+      decoded: Data(
+        portnum: resolvedPort,
+        payload: payload,
+      ),
+      wantAck: wantAck,
+      hopLimit: 3,
+      priority: MeshPacket_Priority.DEFAULT,
+    );
+
+    _logger.info(
+      'Sending data: portNum=$portNum, ${payload.length} bytes '
+      'from ${packet.from.toRadixString(16)} to ${packet.to.toRadixString(16)} '
+      'on channel $channel',
     );
     await _sendPacket(packet);
   }
@@ -563,6 +621,8 @@ class MeshtasticClient {
     MeshtasticConnectionState state, {
     String? errorMessage,
   }) {
+    if (_connectionController.isClosed) return;
+
     final status = ConnectionStatus(
       state: state,
       deviceAddress: _device?.remoteId.toString(),
@@ -578,7 +638,7 @@ class MeshtasticClient {
   void dispose() {
     _logger.info('Disposing Meshtastic client');
 
-    disconnect();
+    disconnect(emitState: false);
     _connectionController.close();
     _packetController.close();
     _nodeController.close();

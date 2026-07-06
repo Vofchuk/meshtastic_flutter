@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'dart:typed_data';
 import 'package:meshtastic_flutter/meshtastic_flutter.dart';
 import 'package:meshtastic_flutter/generated/portnums.pb.dart';
 
@@ -75,6 +76,31 @@ void main() {
       expect(wrapper.textMessage, 'Hello');
       expect(wrapper.isDirectMessage, isTrue);
       expect(wrapper.isBroadcast, isFalse);
+    });
+
+    test('exposes portNum and raw payload', () {
+      final payload = Uint8List.fromList([0x01, 0x02, 0x03]);
+      final packet = MeshPacket(
+        from: 0x12345678,
+        to: 0xFFFFFFFF,
+        channel: 1,
+        id: 99,
+        decoded: Data(
+          portnum: PortNum.PRIVATE_APP,
+          payload: payload,
+        ),
+      );
+
+      final wrapper = MeshPacketWrapper(packet);
+      expect(wrapper.portNum, 256);
+      expect(wrapper.payload, payload);
+      expect(wrapper.portnum, PortNum.PRIVATE_APP);
+    });
+  });
+
+  group('MeshtasticClient constants', () {
+    test('broadcastId is Meshtastic broadcast address', () {
+      expect(MeshtasticClient.broadcastId, 0xFFFFFFFF);
     });
   });
 
