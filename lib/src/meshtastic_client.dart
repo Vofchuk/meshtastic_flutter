@@ -6,11 +6,13 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:logging/logging.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../generated/admin.pb.dart';
 import '../generated/mesh.pb.dart';
 import '../generated/config.pb.dart';
 import '../generated/module_config.pb.dart';
 import '../generated/channel.pb.dart';
 import '../generated/portnums.pb.dart';
+import 'channel_utils.dart';
 import 'models/connection_state.dart';
 import 'models/mesh_packet_wrapper.dart';
 import 'models/node_info.dart';
@@ -62,6 +64,10 @@ class MeshtasticClient {
   bool _configComplete = false;
   int _expectedFromNum = 0;
 
+  Uint8List? _sessionPasskey;
+  int _adminPacketId = 0;
+  final Map<int, Completer<AdminMessage>> _pendingAdminResponses = {};
+
   // Public streams
   Stream<ConnectionStatus> get connectionStream => _connectionController.stream;
   Stream<MeshPacketWrapper> get packetStream => _packetController.stream;
@@ -81,6 +87,30 @@ class MeshtasticClient {
   User? get localUser => _localUser;
   bool get isConnected => _device?.isConnected ?? false;
   bool get isConfigured => _configComplete;
+
+  int get myNodeNum => _myNodeInfo?.myNodeNum ?? 0;
+
+  List<Channel> get channels => List.unmodifiable(_channels);
+
+  /// Parses a Meshtastic PSK string (Base64 URL-safe/standard or hex).
+  static Uint8List parsePsk(String input) => ChannelUtils.parsePsk(input);
+
+  /// Finds a configured channel index matching [name], or null.
+  int? findChannelIndexByName({required String name}) {
+    return ChannelUtils.findChannelIndexByName(_channels, name: name);
+  }
+
+  /// Finds a configured channel index matching [name] and [psk], or null.
+  int? findChannelIndex({
+    required String name,
+    required Uint8List psk,
+  }) {
+    return ChannelUtils.findChannelIndex(
+      _channels,
+      name: name,
+      psk: psk,
+    );
+  }
 
   /// Initialize the client and request necessary permissions
   Future<void> initialize() async {
@@ -363,6 +393,7 @@ class MeshtasticClient {
     _moduleConfig = null;
     _channels.clear();
     _localUser = null;
+    resetAdminSession();
 
     if (emitState) {
       _emitConnectionState(MeshtasticConnectionState.disconnected);
@@ -403,7 +434,7 @@ class MeshtasticClient {
     _logger.info(
       'Sending text message: "$message" from ${packet.from.toRadixString(16)} to ${packet.to.toRadixString(16)} on channel $channel',
     );
-    await _sendPacket(packet);
+    await sendMeshPacket(packet);
   }
 
   /// Send a position update
@@ -445,7 +476,7 @@ class MeshtasticClient {
     _logger.info(
       'Sending position: lat=$latitude, lon=$longitude, alt=$altitude',
     );
-    await _sendPacket(packet);
+    await sendMeshPacket(packet);
   }
 
   /// Send an arbitrary binary payload on a custom port number.
@@ -498,11 +529,34 @@ class MeshtasticClient {
       'from ${packet.from.toRadixString(16)} to ${packet.to.toRadixString(16)} '
       'on channel $channel',
     );
-    await _sendPacket(packet);
+    await sendMeshPacket(packet);
+  }
+
+  void _assertConnectedAndConfigured() {
+    if (!isConnected) {
+      throw const ConnectionException('Not connected to a device');
+    }
+    if (!isConfigured) {
+      throw const ConnectionException('Device configuration not complete');
+    }
+    if (myNodeNum == 0) {
+      throw const ConfigurationException('Local node ID not available');
+    }
+  }
+
+  void _updateChannelInCache(Channel channel) {
+    if (channel.index < _channels.length) {
+      _channels[channel.index] = channel;
+    } else {
+      while (_channels.length <= channel.index) {
+        _channels.add(Channel());
+      }
+      _channels[channel.index] = channel;
+    }
   }
 
   /// Send a packet to the device
-  Future<void> _sendPacket(MeshPacket packet) async {
+  Future<void> sendMeshPacket(MeshPacket packet) async {
     if (_toRadioChar == null) {
       throw const ConnectionException('ToRadio characteristic not available');
     }
@@ -523,9 +577,14 @@ class MeshtasticClient {
     final supportsWriteWithoutResponse =
         _toRadioChar!.properties.writeWithoutResponse;
 
+    // Android/iOS cap single withResponse writes at 252 B unless longWrite is used.
+    final allowLongWrite =
+        !supportsWriteWithoutResponse && data.length > 252;
+
     await _toRadioChar!.write(
       data,
       withoutResponse: supportsWriteWithoutResponse,
+      allowLongWrite: allowLongWrite,
     );
 
     _logger.fine('Packet sent successfully');
@@ -633,6 +692,7 @@ class MeshtasticClient {
       }
 
       if (fromRadio.hasPacket()) {
+        _handleAdminPacket(fromRadio.packet);
         final packetWrapper = MeshPacketWrapper(fromRadio.packet);
         _packetController.add(packetWrapper);
         _logger.info('Received MeshPacket: ${packetWrapper.toString()}');
@@ -711,6 +771,238 @@ class MeshtasticClient {
     );
 
     _connectionController.add(status);
+  }
+
+  /// Cached session passkey from the last admin handshake, if any.
+  Uint8List? get sessionPasskey => _sessionPasskey;
+
+  void resetAdminSession() {
+    _sessionPasskey = null;
+    for (final pending in _pendingAdminResponses.values) {
+      if (!pending.isCompleted) {
+        pending.completeError(
+          const ConnectionException('Admin session reset'),
+        );
+      }
+    }
+    _pendingAdminResponses.clear();
+  }
+
+  void _handleAdminPacket(MeshPacket packet) {
+    if (!packet.hasDecoded()) return;
+    if (packet.decoded.portnum != PortNum.ADMIN_APP) return;
+
+    AdminMessage response;
+    try {
+      response = AdminMessage.fromBuffer(packet.decoded.payload);
+    } catch (error) {
+      _logger.warning('Failed to parse AdminMessage: $error');
+      return;
+    }
+
+    if (response.sessionPasskey.isNotEmpty) {
+      _sessionPasskey = Uint8List.fromList(response.sessionPasskey);
+      _logger.fine(
+        'Updated session passkey (${_sessionPasskey!.length} bytes)',
+      );
+    }
+
+    final requestId = packet.decoded.requestId;
+    if (requestId != 0) {
+      final pending = _pendingAdminResponses.remove(requestId);
+      pending?.complete(response);
+    } else if (_pendingAdminResponses.length == 1 &&
+        response.hasGetOwnerResponse()) {
+      final entry = _pendingAdminResponses.entries.first;
+      entry.value.complete(response);
+      _pendingAdminResponses.remove(entry.key);
+    }
+  }
+
+  Future<AdminMessage> sendAdminMessage(
+    AdminMessage message, {
+    bool stateChanging = true,
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    _assertConnectedAndConfigured();
+
+    if (stateChanging) {
+      await ensureSessionPasskey(timeout: timeout);
+      message.sessionPasskey = _sessionPasskey!;
+    }
+
+    final packetId = _nextAdminPacketId();
+    final completer = Completer<AdminMessage>();
+    _pendingAdminResponses[packetId] = completer;
+
+    final packet = MeshPacket(
+      from: myNodeNum,
+      to: myNodeNum,
+      channel: 0,
+      id: packetId,
+      decoded: Data(
+        portnum: PortNum.ADMIN_APP,
+        payload: message.writeToBuffer(),
+        requestId: packetId,
+      ),
+      hopLimit: 3,
+      priority: MeshPacket_Priority.RELIABLE,
+    );
+
+    try {
+      await sendMeshPacket(packet);
+      return await completer.future.timeout(
+        timeout,
+        onTimeout: () {
+          _pendingAdminResponses.remove(packetId);
+          throw TimeoutException(
+            'Admin request timed out after ${timeout.inSeconds}s',
+          );
+        },
+      );
+    } catch (error) {
+      _pendingAdminResponses.remove(packetId);
+      rethrow;
+    }
+  }
+
+  Future<void> _sendAdminMessageNoWait(
+    AdminMessage message, {
+    bool stateChanging = true,
+  }) async {
+    _assertConnectedAndConfigured();
+
+    if (stateChanging) {
+      await ensureSessionPasskey();
+      message.sessionPasskey = _sessionPasskey!;
+    }
+
+    final packetId = _nextAdminPacketId();
+    final packet = MeshPacket(
+      from: myNodeNum,
+      to: myNodeNum,
+      channel: 0,
+      id: packetId,
+      decoded: Data(
+        portnum: PortNum.ADMIN_APP,
+        payload: message.writeToBuffer(),
+        requestId: packetId,
+      ),
+      hopLimit: 3,
+      priority: MeshPacket_Priority.RELIABLE,
+    );
+
+    await sendMeshPacket(packet);
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+  }
+
+  Future<void> ensureSessionPasskey({
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    if (_sessionPasskey != null && _sessionPasskey!.isNotEmpty) return;
+
+    final response = await sendAdminMessage(
+      AdminMessage(getOwnerRequest: true),
+      stateChanging: false,
+      timeout: timeout,
+    );
+
+    if (_sessionPasskey == null || _sessionPasskey!.isEmpty) {
+      if (response.sessionPasskey.isNotEmpty) {
+        _sessionPasskey = Uint8List.fromList(response.sessionPasskey);
+      }
+    }
+
+    if (_sessionPasskey == null || _sessionPasskey!.isEmpty) {
+      throw const ConfigurationException(
+        'Device did not provide an admin session passkey',
+      );
+    }
+  }
+
+  Future<void> setChannel({
+    required int index,
+    required String name,
+    required Uint8List psk,
+    Channel_Role role = Channel_Role.SECONDARY,
+  }) async {
+    if (index < 0 || index >= ChannelUtils.maxChannelSlots) {
+      throw ArgumentError.value(index, 'index', 'Channel index must be 0..7');
+    }
+    if (name.isEmpty) {
+      throw ArgumentError.value(name, 'name', 'Channel name must not be empty');
+    }
+    if (psk.isEmpty) {
+      throw ArgumentError.value(psk, 'psk', 'PSK must not be empty');
+    }
+
+    final channel = Channel(
+      index: index,
+      role: role,
+      settings: ChannelSettings(
+        name: name,
+        psk: psk,
+        uplinkEnabled: false,
+        downlinkEnabled: false,
+      ),
+    );
+
+    await _sendAdminMessageNoWait(AdminMessage(beginEditSettings: true));
+    await _sendAdminMessageNoWait(AdminMessage(setChannel: channel));
+    await _sendAdminMessageNoWait(AdminMessage(commitEditSettings: true));
+
+    _updateChannelInCache(channel);
+    _logger.info('Set channel $index "$name" (${psk.length}-byte PSK)');
+  }
+
+  /// Ensures [name]/[psk] exist on the node; returns the channel index.
+  ///
+  /// Never overwrites a channel that already exists with the same [name] —
+  /// manual configuration via the official Meshtastic app is preserved.
+  Future<int> ensureChannel({
+    required String name,
+    required Uint8List psk,
+  }) async {
+    _assertConnectedAndConfigured();
+
+    final existingByName = ChannelUtils.findChannelIndexByName(
+      channels,
+      name: name,
+    );
+    if (existingByName != null) {
+      _logger.info(
+        'Channel "$name" already present at index $existingByName — leaving unchanged',
+      );
+      return existingByName;
+    }
+
+    final existing = ChannelUtils.findChannelIndex(
+      channels,
+      name: name,
+      psk: psk,
+    );
+    if (existing != null) return existing;
+
+    final targetIndex = ChannelUtils.findNextSecondarySlot(channels) ??
+        (throw const ConfigurationException(
+          'No free secondary channel slot (max 8 channels)',
+        ));
+
+    _logger.info('Creating channel $targetIndex "$name"');
+
+    await setChannel(
+      index: targetIndex,
+      name: name,
+      psk: psk,
+    );
+
+    return targetIndex;
+  }
+
+  int _nextAdminPacketId() {
+    _adminPacketId = (_adminPacketId + 1) & 0xFFFFFFFF;
+    if (_adminPacketId == 0) _adminPacketId = 1;
+    return _adminPacketId;
   }
 
   /// Dispose of the client and clean up resources
