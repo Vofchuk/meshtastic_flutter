@@ -136,8 +136,19 @@ class MeshtasticClient {
     Duration timeout,
   ) async {
     final seen = <String>{};
+    StreamSubscription<List<ScanResult>>? scanSub;
 
     try {
+      for (final device in await FlutterBluePlus.bondedDevices) {
+        if (!_isMeshtasticDevice(device)) continue;
+        if (seen.add(device.remoteId.str)) {
+          _logger.info(
+            'Bonded Meshtastic device: ${device.platformName} (${device.remoteId})',
+          );
+          controller.add(device);
+        }
+      }
+
       for (final device in await _loadSystemMeshtasticDevices()) {
         if (seen.add(device.remoteId.str)) {
           _logger.info(
@@ -149,33 +160,38 @@ class MeshtasticClient {
 
       await FlutterBluePlus.stopScan();
 
-      final scanSub = FlutterBluePlus.onScanResults.listen((results) {
+      scanSub = FlutterBluePlus.onScanResults.listen((results) {
         for (final result in results) {
           if (!_isMeshtasticScanResult(result)) continue;
           final device = result.device;
           if (seen.add(device.remoteId.str)) {
             _logger.info(
-              'Found Meshtastic device: ${device.platformName} (${device.remoteId})',
+              'Found Meshtastic device: ${device.platformName} (${device.remoteId}) '
+              'adv="${result.advertisementData.advName}"',
             );
             controller.add(device);
           }
         }
       });
 
+      // Do not use withNames — flutter_blue_plus requires an exact name match,
+      // so "Meshtastic_c6c8" would be missed. Filter in Dart instead.
       await FlutterBluePlus.startScan(
-        withNames: ['Meshtastic'],
         timeout: timeout,
         androidUsesFineLocation: true,
+        androidScanMode: AndroidScanMode.lowLatency,
       );
 
       await Future<void>.delayed(timeout);
-      await scanSub.cancel();
-      await FlutterBluePlus.stopScan();
-      await controller.close();
     } catch (error, stackTrace) {
       _logger.warning('Scan failed: $error');
       if (!controller.isClosed) {
         controller.addError(error, stackTrace);
+      }
+    } finally {
+      await scanSub?.cancel();
+      await FlutterBluePlus.stopScan();
+      if (!controller.isClosed) {
         await controller.close();
       }
     }
@@ -190,25 +206,39 @@ class MeshtasticClient {
     }
   }
 
-  bool _isMeshtasticScanResult(ScanResult result) {
-    final adv = result.advertisementData;
-    for (final name in [
-      result.device.platformName,
-      adv.advName,
-    ]) {
-      if (name.toLowerCase().startsWith('meshtastic')) return true;
-    }
+  bool _isMeshtasticDevice(BluetoothDevice device) {
+    return device.platformName.toLowerCase().contains('meshtastic');
+  }
 
-    return adv.serviceUuids.any(
+  bool _isMeshtasticScanResult(ScanResult result) {
+    if (_isMeshtasticDevice(result.device)) return true;
+
+    final advName = result.advertisementData.advName;
+    if (advName.toLowerCase().contains('meshtastic')) return true;
+
+    return result.advertisementData.serviceUuids.any(
       (uuid) => uuid.toString().toLowerCase() == _serviceUuid.toLowerCase(),
     );
   }
 
   /// Connect to a device by BLE address (e.g. 10:51:DB:2A:C6:C9).
   Future<void> connectToAddress(String address) async {
-    final normalized = address.trim().toUpperCase();
+    final normalized = _normalizeMacAddress(address);
     final device = BluetoothDevice.fromId(normalized);
     await connectToDevice(device);
+  }
+
+  String _normalizeMacAddress(String address) {
+    final trimmed = address.trim().toUpperCase();
+    if (trimmed.contains(':')) return trimmed;
+    if (trimmed.length != 12) {
+      throw ArgumentError.value(address, 'address', 'Expected MAC like 10:51:DB:2A:C6:C9');
+    }
+    final pairs = <String>[];
+    for (var i = 0; i < 12; i += 2) {
+      pairs.add(trimmed.substring(i, i + 2));
+    }
+    return pairs.join(':');
   }
 
   /// Connect to a specific Meshtastic device
