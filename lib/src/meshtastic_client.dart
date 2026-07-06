@@ -122,44 +122,93 @@ class MeshtasticClient {
 
   /// Scan for nearby Meshtastic devices
   Stream<BluetoothDevice> scanForDevices({
-    Duration timeout = const Duration(seconds: 10),
-  }) async* {
-    _logger.info('Scanning for Meshtastic devices');
-
-    final completer = Completer<void>();
-    Timer(timeout, () {
-      if (!completer.isCompleted) {
-        completer.complete();
-        FlutterBluePlus.stopScan();
-      }
-    });
-
-    // Start scanning with service UUID filter
-    await FlutterBluePlus.startScan(
-      withServices: [Guid(_serviceUuid)],
-      timeout: timeout,
+    Duration timeout = const Duration(seconds: 15),
+  }) {
+    late StreamController<BluetoothDevice> controller;
+    controller = StreamController<BluetoothDevice>(
+      onListen: () => unawaited(_runDeviceScan(controller, timeout)),
     );
+    return controller.stream;
+  }
 
-    await for (final results in FlutterBluePlus.scanResults) {
-      if (completer.isCompleted) break;
+  Future<void> _runDeviceScan(
+    StreamController<BluetoothDevice> controller,
+    Duration timeout,
+  ) async {
+    final seen = <String>{};
 
-      for (final result in results) {
-        final device = result.device;
-        if (device.platformName.isNotEmpty ||
-            result.advertisementData.serviceUuids.contains(
-              Guid(_serviceUuid),
-            )) {
+    try {
+      for (final device in await _loadSystemMeshtasticDevices()) {
+        if (seen.add(device.remoteId.str)) {
           _logger.info(
-            'Found Meshtastic device: ${device.platformName} (${device.remoteId})',
+            'Known Meshtastic device: ${device.platformName} (${device.remoteId})',
           );
-          yield device;
+          controller.add(device);
         }
       }
+
+      await FlutterBluePlus.stopScan();
+
+      final scanSub = FlutterBluePlus.onScanResults.listen((results) {
+        for (final result in results) {
+          if (!_isMeshtasticScanResult(result)) continue;
+          final device = result.device;
+          if (seen.add(device.remoteId.str)) {
+            _logger.info(
+              'Found Meshtastic device: ${device.platformName} (${device.remoteId})',
+            );
+            controller.add(device);
+          }
+        }
+      });
+
+      await FlutterBluePlus.startScan(
+        withNames: ['Meshtastic'],
+        timeout: timeout,
+        androidUsesFineLocation: true,
+      );
+
+      await Future<void>.delayed(timeout);
+      await scanSub.cancel();
+      await FlutterBluePlus.stopScan();
+      await controller.close();
+    } catch (error, stackTrace) {
+      _logger.warning('Scan failed: $error');
+      if (!controller.isClosed) {
+        controller.addError(error, stackTrace);
+        await controller.close();
+      }
+    }
+  }
+
+  Future<List<BluetoothDevice>> _loadSystemMeshtasticDevices() async {
+    try {
+      return await FlutterBluePlus.systemDevices([Guid(_serviceUuid)]);
+    } catch (error) {
+      _logger.fine('systemDevices unavailable: $error');
+      return const [];
+    }
+  }
+
+  bool _isMeshtasticScanResult(ScanResult result) {
+    final adv = result.advertisementData;
+    for (final name in [
+      result.device.platformName,
+      adv.advName,
+    ]) {
+      if (name.toLowerCase().startsWith('meshtastic')) return true;
     }
 
-    if (!completer.isCompleted) {
-      completer.complete();
-    }
+    return adv.serviceUuids.any(
+      (uuid) => uuid.toString().toLowerCase() == _serviceUuid.toLowerCase(),
+    );
+  }
+
+  /// Connect to a device by BLE address (e.g. 10:51:DB:2A:C6:C9).
+  Future<void> connectToAddress(String address) async {
+    final normalized = address.trim().toUpperCase();
+    final device = BluetoothDevice.fromId(normalized);
+    await connectToDevice(device);
   }
 
   /// Connect to a specific Meshtastic device
